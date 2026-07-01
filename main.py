@@ -1,11 +1,13 @@
 import asyncio
+import io
 import json
 import os
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pypdf import PdfReader
+from starlette.datastructures import UploadFile
 
 app = FastAPI(title="Reeds Jobs API")
 
@@ -86,9 +88,71 @@ async def get_jobs() -> dict:
     return {"count": len(jobs), "jobs": jobs}
 
 
-class RankRequest(BaseModel):
-    cv: str = Field(..., min_length=1, description="The candidate's CV / resume text.")
-    role: str = Field(..., min_length=1, description="The role the candidate wants.")
+# Field names the frontend might use for the role and the CV (case-insensitive).
+_ROLE_FIELDS = {"role", "target_role", "targetrole", "job_role", "jobrole", "position"}
+_CV_TEXT_FIELDS = {"cv", "resume", "cv_text", "resume_text", "text"}
+
+
+def _pdf_to_text(raw: bytes) -> str:
+    """Extract text from PDF bytes; returns '' if it can't be parsed."""
+    try:
+        reader = PdfReader(io.BytesIO(raw))
+        return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    except Exception:
+        return ""
+
+
+async def _upload_to_text(upload: UploadFile) -> str:
+    """Read an uploaded resume file and return its text (handles PDF and plain text)."""
+    raw = await upload.read()
+    filename = (upload.filename or "").lower()
+    content_type = (upload.content_type or "").lower()
+    if filename.endswith(".pdf") or "pdf" in content_type:
+        return _pdf_to_text(raw)
+    return raw.decode("utf-8", errors="ignore").strip()
+
+
+async def _extract_cv_and_role(request: Request) -> tuple[str, str]:
+    """Pull (cv_text, role) from either a JSON body or a multipart/form-data upload."""
+    content_type = request.headers.get("content-type", "")
+
+    if content_type.startswith("application/json"):
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid JSON body.")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=422, detail="JSON body must be an object.")
+        return str(body.get("cv") or "").strip(), str(body.get("role") or "").strip()
+
+    # Otherwise treat it as form data (what the PDF-upload frontend sends).
+    form = await request.form()
+    items = form.multi_items()
+    text_fields = [(k, v) for k, v in items if isinstance(v, str)]
+    file_fields = [(k, v) for k, v in items if isinstance(v, UploadFile)]
+
+    # Role: a role-named text field, else the only text field if there's just one.
+    role = ""
+    for key, value in text_fields:
+        if key.lower() in _ROLE_FIELDS and value.strip():
+            role = value.strip()
+            break
+    if not role and len(text_fields) == 1 and text_fields[0][1].strip():
+        role = text_fields[0][1].strip()
+
+    # CV: prefer an uploaded file, else a cv-named text field.
+    cv = ""
+    for _key, upload in file_fields:
+        cv = await _upload_to_text(upload)
+        if cv:
+            break
+    if not cv:
+        for key, value in text_fields:
+            if key.lower() in _CV_TEXT_FIELDS and value.strip():
+                cv = value.strip()
+                break
+
+    return cv, role
 
 
 def _build_ranking_prompt(cv: str, role: str, batch: list[tuple[int, dict]]) -> str:
@@ -168,11 +232,27 @@ async def _score_batch(
 
 
 @app.post("/rank")
-async def rank_jobs(request: RankRequest) -> dict:
-    """Rank all jobs by how well they fit the given CV and desired role via Gemini."""
+async def rank_jobs(request: Request) -> dict:
+    """Rank all jobs by how well they fit the given CV and desired role via Gemini.
+
+    Accepts either a JSON body ``{"cv": "...", "role": "..."}`` or a
+    ``multipart/form-data`` upload with a resume file (PDF or text) plus a
+    ``role`` field, so browser file uploads work directly.
+    """
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured.")
+
+    cv, role = await _extract_cv_and_role(request)
+    if not cv:
+        raise HTTPException(
+            status_code=422,
+            detail="Missing CV: provide 'cv' text (JSON) or upload a resume file "
+            "(form-data). If you uploaded a PDF, it may be scanned/image-only with "
+            "no extractable text.",
+        )
+    if not role:
+        raise HTTPException(status_code=422, detail="Missing 'role'.")
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         jobs = await fetch_all_jobs(client)
@@ -187,7 +267,7 @@ async def rank_jobs(request: RankRequest) -> dict:
 
         async def run(batch: list[tuple[int, dict]]) -> dict[int, dict]:
             async with semaphore:
-                return await _score_batch(client, api_key, request.cv, request.role, batch)
+                return await _score_batch(client, api_key, cv, role, batch)
 
         batch_results = await asyncio.gather(
             *(run(batch) for batch in batches),
